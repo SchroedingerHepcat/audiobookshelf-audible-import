@@ -1,6 +1,7 @@
 #! /usr/bin/env python3
 
 import json
+import logging
 import os
 import os.path
 import pathlib
@@ -34,13 +35,14 @@ config['tmp_dir'] = '/tmp'
 
 
 def get_audible_library(auth=None):
+    logger = logging.getLogger(__name__)
     if not auth:
         auth = audible.Authenticator.from_file(config['audible_auth_file'])
     with audible.Client(auth=auth) as client:
         library = []
         page = 1
         while True:
-            print(f"...Retrieving library index page {page}...")
+            logger.info(f"...Retrieving library index page {page}...")
             books = client.get("1.0/library"
                               ,num_results=100
                               ,page=page
@@ -62,6 +64,7 @@ def get_audible_library(auth=None):
 
 
 def get_audible_product(asin, auth=None):
+    logger = logging.getLogger(__name__)
     if not auth:
         auth = audible.Authenticator.from_file(config['audible_auth_file'])
     with audible.Client(auth=auth) as client:
@@ -78,13 +81,8 @@ def get_audible_product(asin, auth=None):
         return product
 
 
-def setupDatabase(filename):
-    con = sqlite3.connect(filename)
-    cur = con.cursor()
-    cur.execute('CREATE TABLE books(asin, title, location)')
-
-
 def download_book_as_aax(asin, quality, download_dir, filename_mode='asin_ascii'):
+    logger = logging.getLogger(__name__)
     os.chdir(download_dir)
     audible_cli.cli.cli(['download'
                         ,'--asin', asin
@@ -300,12 +298,23 @@ class ImportDatabase:
     def __init__(self, db_file):
         self.con = sqlite3.connect(db_file)
         self.cur = self.con.cursor()
+        self.setupDatabase(config['db'])
 
-    def is_already_imported(self, asin):
+    def is_book_already_imported(self, asin):
         '''
         Check whether specified book has already been imported
         '''
         res = self.cur.execute("SELECT asin FROM books WHERE asin = ?", (asin,))
+        return len(res.fetchall()) > 0
+
+    def is_podcast_episode_already_imported(self, asin):
+        '''
+        Check whether specified book has already been imported
+        '''
+        res = self.cur.execute("SELECT asin FROM podcast_episodes "
+                               "WHERE asin = ?"
+                              ,(asin,)
+                              )
         return len(res.fetchall()) > 0
 
     def record_book_as_imported(self, asin, title, abs_path, abs_dir):
@@ -318,41 +327,57 @@ class ImportDatabase:
                         )
         self.con.commit()
 
+    def setupDatabase(self, filename):
+        con = sqlite3.connect(filename)
+        cur = con.cursor()
+        cur.execute('CREATE TABLE if not exists books(asin, title, location)')
+        cur.execute('CREATE TABLE if not exists podcast_episodes(asin, title, '
+                    'location)'
+                   )
+
 
 def main():
-    print("Getting library...")
+    logger = logging.getLogger(__name__)
+    logger.info("Getting library...")
     auth = audible.Authenticator.from_file(config['audible_auth_file'])
     library = get_audible_library(auth)
-    print("Checking for db...")
-    if not os.path.exists(config['db']):
-        print('Setting up database at', config['db'])
-        setupDatabase(config['db'])
-    print("Connecting to db...")
+    logger.info("Connecting to db...")
     db = ImportDatabase(config['db'])
-    print("Handling library...")
+    logger.info("Handling library...")
     for book in library:
         # Check if book has already been downloaded and added to library
-        print("ASIN:", book['asin'])
+        logger.debug("ASIN:", book['asin'])
         if book['asin'] in asin_to_skip:
             continue
 
-        if db.is_already_imported(book['asin']):
+        if db.is_book_already_imported(book['asin']):
             # This book has already been downloaded and added to the library so
             # move on to the next book in the list
             continue
 
+        # Check if book is published yet
+        #TODO
+
         # Skip periodicals for now -- TODO
         if book['content_delivery_type'] == 'Periodical':
-            print("Skipping because it is of content delivery type Periodical")
+            logging.warning("Skipping because it is of content delivery type "
+                            "Periodical: %s  %s"
+                           ,book['asin']
+                           ,book['title']
+                           )
             continue
 
         # Skip podcasts for now -- TODO
         if book['content_delivery_type'] == 'PodcastParent':
-            print("Skipping because it is of content delivery type PodcastParent")
+            logging.warning("Skipping because it is of content delivery type "
+                            "PodcastParent: %s  %s"
+                           ,book['asin']
+                           ,book['title']
+                           )
             continue
 
         # Download book as aax
-        print('Trying to download as aax:', book['asin'])
+        logger.info('Trying to download as aax:', book['asin'])
         aax_paths = download_product_as_aax(
                          asin=book['asin']
                         ,quality=config['quality']
@@ -362,7 +387,7 @@ def main():
             tmp_m4b_file = convert_aax_to_m4b(aax_paths, output_dir=config['tmp_dir'])
         else:
             # Download book as aaxc
-            print('Trying to download as aaxc:', book['asin'])
+            logger.info('Trying to download as aaxc:', book['asin'])
             aaxc_paths, voucher_paths = download_product_as_aaxc(
                  book['asin']
                  ,quality=config['quality']
@@ -378,7 +403,11 @@ def main():
                                                   )
 
             else:
-                print("No aax or aaxc file for this title:", book['asin'], book['title'])
+                logger.warning("No aax or aaxc file for this title: ASIN: %s "
+                               "Title: %s"
+                              ,book['asin']
+                              ,book['title']
+                              )
                 continue
 
         # Put it in place in the audiobookshelf
