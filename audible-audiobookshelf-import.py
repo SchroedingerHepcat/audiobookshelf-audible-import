@@ -343,6 +343,57 @@ def is_product_released(product_info):
     return release_date <= datetime.now()
 
 
+def add_book(book, db):
+    logger = logging.getLogger(__name__)
+    # Download book as aax
+    logger.info('Trying to download as aax: %s', book['asin'])
+    aax_paths = download_product_as_aax(
+                     asin=book['asin']
+                    ,quality=config['quality']
+                    ,download_dir=config['audible_download_dir']
+                    )
+    if len(aax_paths) > 0:
+        tmp_m4b_file = convert_aax_to_m4b(aax_paths, output_dir=config['tmp_dir'])
+    else:
+        # Download book as aaxc
+        logger.info('Trying to download as aaxc: %s', book['asin'])
+        aaxc_paths, voucher_paths = download_product_as_aaxc(
+             book['asin']
+             ,quality=config['quality']
+             ,download_dir=config['audible_download_dir']
+             ,filename_mode='asin_ascii'
+        )
+
+        # Check for aaxc file
+        if len(aaxc_paths) > 0 and len(voucher_paths) > 0:
+            tmp_m4b_file = convert_aaxc_to_m4b(aaxc_paths=aaxc_paths
+                                              ,voucher_paths=voucher_paths
+                                              ,output_dir=config['tmp_dir']
+                                              )
+
+        else:
+            logger.warning("No aax or aaxc file for this title: ASIN: %s "
+                           "Title: %s"
+                          ,book['asin']
+                          ,book['title']
+                          )
+            return
+
+    # Put it in place in the audiobookshelf
+    title, abs_path = import_audiobook_into_audiobookshelf(
+         m4b_file=tmp_m4b_file
+        ,book_info=book
+        ,abs_dir=config['audiobookshelf_dir']
+    )
+
+    # Record it as having been added to the library
+    db.record_book_as_imported(asin=book['asin']
+                              ,title=title
+                              ,abs_path=abs_path
+                              ,abs_dir=config['audiobookshelf_dir']
+                              )
+
+
 def main():
     logger = logging.getLogger(__name__)
     logger.info("Getting library...")
@@ -391,62 +442,19 @@ def main():
                           )
             continue
 
-        # Check if book is published yet
-        if not is_product_released(book):
-            logger.warning('Book is not yet released: %s %s - Release date: %s'
-                          ,book['asin']
-                          ,book['title']
-                          ,book['release_date']
-                          )
-            continue
-
-        # Download book as aax
-        logger.info('Trying to download as aax: %s', book['asin'])
-        aax_paths = download_product_as_aax(
-                         asin=book['asin']
-                        ,quality=config['quality']
-                        ,download_dir=config['audible_download_dir']
-                        )
-        if len(aax_paths) > 0:
-            tmp_m4b_file = convert_aax_to_m4b(aax_paths, output_dir=config['tmp_dir'])
-        else:
-            # Download book as aaxc
-            logger.info('Trying to download as aaxc: %s', book['asin'])
-            aaxc_paths, voucher_paths = download_product_as_aaxc(
-                 book['asin']
-                 ,quality=config['quality']
-                 ,download_dir=config['audible_download_dir']
-                 ,filename_mode='asin_ascii'
-            )
-
-            # Check for aaxc file
-            if len(aaxc_paths) > 0 and len(voucher_paths) > 0:
-                tmp_m4b_file = convert_aaxc_to_m4b(aaxc_paths=aaxc_paths
-                                                  ,voucher_paths=voucher_paths
-                                                  ,output_dir=config['tmp_dir']
-                                                  )
-
-            else:
-                logger.warning("No aax or aaxc file for this title: ASIN: %s "
-                               "Title: %s"
+        if (  book['content_delivery_type'] == 'SinglePartBook'
+           or book['content_delivery_type'] == 'MultiPartBook'
+           ):
+            # Check if book is published yet
+            if not is_product_released(book):
+                logger.warning('Book is not yet released: %s %s - Release date: %s'
                               ,book['asin']
                               ,book['title']
+                              ,book['release_date']
                               )
                 continue
+            add_book(book, db)
 
-        # Put it in place in the audiobookshelf
-        title, abs_path = import_audiobook_into_audiobookshelf(
-             m4b_file=tmp_m4b_file
-            ,book_info=book
-            ,abs_dir=config['audiobookshelf_dir']
-        )
-
-        # Record it as having been added to the library
-        db.record_book_as_imported(asin=book['asin']
-                                  ,title=title
-                                  ,abs_path=abs_path
-                                  ,abs_dir=config['audiobookshelf_dir']
-                                  )
 
 if __name__ == "__main__":
     log_level = os.environ.get('LOG_LEVEL', 'WARNING').upper()
