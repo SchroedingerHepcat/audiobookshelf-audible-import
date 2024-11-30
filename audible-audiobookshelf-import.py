@@ -1,5 +1,6 @@
 #! /usr/bin/env python3
 
+from datetime import datetime
 import json
 import logging
 import os
@@ -31,7 +32,7 @@ config['audiobookshelf_dir'] = pathlib.Path.home() / 'data' / 'Audiobooks'
 config['activation_bytes'] = '2b6d2001'
 config['tmp_dir'] = '/tmp'
 
-
+release_date_format = "%Y-%m-%d"
 
 
 def get_audible_library(auth=None):
@@ -336,6 +337,12 @@ class ImportDatabase:
                    )
 
 
+def is_product_released(product_info):
+    date_format = "%Y-%m-%d"
+    release_date = datetime.strptime(product_info['release_date'], date_format)
+    return release_date <= datetime.now()
+
+
 def main():
     logger = logging.getLogger(__name__)
     logger.info("Getting library...")
@@ -346,38 +353,55 @@ def main():
     logger.info("Handling library...")
     for book in library:
         # Check if book has already been downloaded and added to library
-        logger.debug("ASIN:", book['asin'])
+        logger.info("ASIN: %s    Title: %s"
+                   ,book['asin']
+                   ,book['title']
+                   )
         if book['asin'] in asin_to_skip:
+            logger.info('Book is on the skip list: %s  %s'
+                       ,book['asin']
+                       ,book['title']
+                        )
             continue
 
         if db.is_book_already_imported(book['asin']):
             # This book has already been downloaded and added to the library so
             # move on to the next book in the list
+            logger.info('Book is already imported: %s  %s'
+                       ,book['asin']
+                       ,book['title']
+                        )
             continue
-
-        # Check if book is published yet
-        #TODO
 
         # Skip periodicals for now -- TODO
         if book['content_delivery_type'] == 'Periodical':
-            logging.warning("Skipping because it is of content delivery type "
-                            "Periodical: %s  %s"
-                           ,book['asin']
-                           ,book['title']
-                           )
+            logger.warning("Skipping because it is of content delivery type "
+                           "Periodical: %s  %s"
+                          ,book['asin']
+                          ,book['title']
+                          )
             continue
 
         # Skip podcasts for now -- TODO
         if book['content_delivery_type'] == 'PodcastParent':
-            logging.warning("Skipping because it is of content delivery type "
-                            "PodcastParent: %s  %s"
-                           ,book['asin']
-                           ,book['title']
-                           )
+            logger.warning("Skipping because it is of content delivery type "
+                           "PodcastParent: %s  %s"
+                          ,book['asin']
+                          ,book['title']
+                          )
+            continue
+
+        # Check if book is published yet
+        if not is_product_released(book):
+            logger.warning('Book is not yet released: %s %s - Release date: %s'
+                          ,book['asin']
+                          ,book['title']
+                          ,book['release_date']
+                          )
             continue
 
         # Download book as aax
-        logger.info('Trying to download as aax:', book['asin'])
+        logger.info('Trying to download as aax: %s', book['asin'])
         aax_paths = download_product_as_aax(
                          asin=book['asin']
                         ,quality=config['quality']
@@ -387,7 +411,7 @@ def main():
             tmp_m4b_file = convert_aax_to_m4b(aax_paths, output_dir=config['tmp_dir'])
         else:
             # Download book as aaxc
-            logger.info('Trying to download as aaxc:', book['asin'])
+            logger.info('Trying to download as aaxc: %s', book['asin'])
             aaxc_paths, voucher_paths = download_product_as_aaxc(
                  book['asin']
                  ,quality=config['quality']
@@ -425,4 +449,6 @@ def main():
                                   )
 
 if __name__ == "__main__":
+    log_level = os.environ.get('LOG_LEVEL', 'WARNING').upper()
+    logging.basicConfig(level=log_level)
     main()
