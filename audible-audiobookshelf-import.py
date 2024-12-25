@@ -29,10 +29,70 @@ config['audible_download_dir'] = pathlib.Path.home() / 'data' / 'Audiobooks2' / 
 #config['audible_auth_file'] = os.path.expanduser('~/.audible/audible.json')
 config['audible_auth_file'] = pathlib.Path.home() / '.audible' / 'audible.json'
 config['audiobookshelf_dir'] = pathlib.Path.home() / 'data' / 'Audiobooks'
+config['audiobookshelf_podcast_dir'] = pathlib.Path.home() / 'data' / 'Audiobooks'
 config['activation_bytes'] = '2b6d2001'
 config['tmp_dir'] = '/tmp'
 
 release_date_format = "%Y-%m-%d"
+
+
+class ImportDatabase:
+    '''
+    Tracks what files have already been imported into audiobookshelf to prevent
+    constant redownloading, reconverting, and/or reimporting of files
+    '''
+    def __init__(self, db_file):
+        self.con = sqlite3.connect(db_file)
+        self.cur = self.con.cursor()
+        self.setup_database(config['db'])
+
+    def is_book_already_imported(self, asin):
+        '''
+        Check whether specified book has already been imported
+        '''
+        res = self.cur.execute("SELECT asin FROM books WHERE asin = ?", (asin,))
+        return len(res.fetchall()) > 0
+
+    def is_podcast_episode_already_imported(self, asin):
+        '''
+        Check whether specified book has already been imported
+        '''
+        res = self.cur.execute("SELECT asin FROM podcast_episodes "
+                               "WHERE asin = ?"
+                              ,(asin,)
+                              )
+        return len(res.fetchall()) > 0
+
+    def record_book_as_imported(self, asin, title, abs_path, abs_dir):
+        '''
+        Record a book as imported
+        '''
+        self.cur.execute('INSERT INTO books (asin, title, location) '
+                         'values (?, ?, ?)'
+                        ,(asin, title, abs_path.relative_to(abs_dir).as_posix())
+                        )
+        self.con.commit()
+
+    def record_episode_as_imported(self, asin, title, abs_path, abs_dir):
+        '''
+        Record a book as imported
+        '''
+        self.cur.execute('INSERT INTO podcast_episodes (asin, title, location) '
+                         'values (?, ?, ?)'
+                        ,(asin, title, abs_path.relative_to(abs_dir).as_posix())
+                        )
+        self.con.commit()
+
+    def setup_database(self, filename):
+        '''
+        Set up database tables
+        '''
+        con = sqlite3.connect(filename)
+        cur = con.cursor()
+        cur.execute('CREATE TABLE if not exists books(asin, title, location)')
+        cur.execute('CREATE TABLE if not exists podcast_episodes(asin, title, '
+                    'location)'
+                   )
 
 
 def get_audible_library(auth=None):
@@ -79,6 +139,8 @@ def get_audible_product(asin, auth=None):
                                               "category_ladders"
                                              )
                            )
+        if 'product' in product:
+            return product['product']
         return product
 
 
@@ -107,6 +169,7 @@ def download_product_as_aax(asin
                            ,quality
                            ,download_dir
                            ,filename_mode='asin_ascii'
+                           ,book=None
                            ):
     os.chdir(download_dir)
     audible_cli.cli.cli(['download'
@@ -121,10 +184,22 @@ def download_product_as_aax(asin
 
     # Get downloaded filename
     # Check for aax file
-    aax_path = list(pathlib.Path(config['audible_download_dir'])
-                   .glob(f"{asin}*.aax")
-                   )
-    return aax_path
+    aax_paths = [p.resolve() for p in download_dir.glob(f'{asin}*.aax')]
+    if book and not aax_paths and book.get('relationships'):
+        parts = [rel for rel in book['relationships']
+                if rel['relationship_type'] == 'component'
+                ]
+        sorted_parts = sorted(parts, key=lambda x: x['sort'])
+        sorted_asins = [p['asin'] for p in sorted_parts]
+        aax_paths = []
+        for a in sorted_asins:
+            part_aax_paths = [   p.resolve()
+                             for p
+                             in download_dir.glob(f'{a}*.aax')
+                             ]
+            if part_aax_paths:
+                aax_paths.extend(part_aax_paths)
+    return aax_paths
 
 
 def download_product_as_aaxc(asin
@@ -135,23 +210,17 @@ def download_product_as_aaxc(asin
     os.chdir(download_dir)
     audible_cli.cli.cli(['download'
                         ,'--asin', asin
-                        ,'--quality', config['quality']
-                        ,'--output-dir', config['audible_download_dir']
-                        ,'--filename-mode', 'asin_ascii'
+                        ,'--quality', quality
+                        ,'--output-dir', download_dir
+                        ,'--filename-mode', filename_mode
                         ,'--aaxc'
                         ]
                        ,standalone_mode=False
                        )
 
     # Check for aaxc file
-    aaxc_paths = [   p.resolve()
-                 for p
-                 in  config['audible_download_dir'].glob(f'{asin}*.aaxc')
-                 ]
-    voucher_paths = [  p.resolve()
-                    for p
-                    in config['audible_download_dir'].glob(f'{asin}*.voucher')
-                    ]
+    aaxc_paths = [p.resolve() for p in  download_dir.glob(f'{asin}*.aaxc')]
+    voucher_paths = [p.resolve() for p in download_dir.glob(f'{asin}*.voucher')]
     return (aaxc_paths, voucher_paths)
 
 
@@ -161,6 +230,7 @@ def download_podcast_episode(asin
                             ,filename_mode='asin_ascii'
                             ):
     #TODO
+    episode_m4b_path = None
     aax_paths = download_product_as_aax(asin=asin
                                        ,download_dir=download_dir
                                        ,quality=quality
@@ -175,52 +245,57 @@ def download_podcast_episode(asin
                                         ,quality=quality
                                         ,filename_mode=filename_mode
                                         )
-        episode_m4b_path = convert_aaxc_to_m4b(aaxc_paths, voucher_paths)
+        if aaxc_paths and voucher_paths:
+            episode_m4b_path = convert_aaxc_to_m4b(aaxc_paths, voucher_paths)
 
     return episode_m4b_path
 
 
-def convert_aax_to_m4b(aax_paths, output_dir=None):
+def convert_aax_to_m4b(aax_paths, output_dir=None, book=None):
     if not output_dir:
         output_dir = config['tmp_dir']
     output_dir = pathlib.Path(output_dir)
-    aax_path = aax_paths[0]
-    m4b_file = (output_dir / aax_path.name).with_suffix(".m4b")
-    (ffmpeg.input(aax_path.as_posix()
-                 ,activation_bytes=config['activation_bytes']
-                 )
-           .output(m4b_file.as_posix(), codec='copy')
-           .run()
-    )
-    return m4b_file
+    m4b_paths = []
+    for aax_path in aax_paths:
+        m4b_file = (output_dir / aax_path.name).with_suffix(".m4b")
+        (ffmpeg.input(aax_path.as_posix()
+                     ,activation_bytes=config['activation_bytes']
+                     )
+               .output(m4b_file.as_posix(), codec='copy')
+               .run()
+        )
+        m4b_paths.append(m4b_file)
+    return m4b_paths
 
 
 def convert_aaxc_to_m4b(aaxc_paths, voucher_paths, output_dir=None):
     if not output_dir:
         output_dir = config['tmp_dir']
     output_dir = pathlib.Path(output_dir)
-    aaxc_path = aaxc_paths[0]
-    m4b_file = (output_dir / aaxc_path.name).with_suffix(".m4b")
+    m4b_files = []
+    for aaxc_path, voucher_path in zip(aaxc_paths, voucher_paths):
+        m4b_file = (output_dir / aaxc_path.name).with_suffix(".m4b")
 
-    # Extract license
-    voucher_path = voucher_paths[0]
-    voucher = json.load(voucher_path.open('r'))
-    voucker_key = voucher['content_license']['license_response']['key']
-    voucher_iv = voucher['content_license']['license_response']['iv']
+        # Extract license
+        voucher = json.load(voucher_path.open('r'))
+        voucker_key = voucher['content_license']['license_response']['key']
+        voucher_iv = voucher['content_license']['license_response']['iv']
 
-    # Convert to m4b
-    (ffmpeg.input(aaxc_path.as_posix()
-                 ,activation_bytes=config['activation_bytes']
-                 ,audible_key=voucker_key
-                 ,audible_iv=voucher_iv
-                 )
-           .output(m4b_file.as_posix(), codec='copy')
-           .run()
-    )
-    return m4b_file
+        # Convert to m4b
+        (ffmpeg.input(aaxc_path.as_posix()
+                     ,activation_bytes=config['activation_bytes']
+                     ,audible_key=voucker_key
+                     ,audible_iv=voucher_iv
+                     )
+               .output(m4b_file.as_posix(), codec='copy')
+               .run()
+        )
+        m4b_files.append(m4b_file)
+    return m4b_files
 
 
-def download_podcast(podcast, download_dir, import_db, auth=None):
+def add_podcast(podcast, download_dir, import_db, auth=None):
+    logger = logging.getLogger(__name__)
     seasons = [child for child in podcast['relationships']
                if     child['relationship_to_product'] == 'child'
                   and child['relationship_type'] == 'season'
@@ -235,6 +310,13 @@ def download_podcast(podcast, download_dir, import_db, auth=None):
                              if     child['relationship_to_product'] == 'child'
                                 and child['relationship_type'] == 'episode'
                             ]
+            add_podcast_episodes(episode_asins=episode_asins
+                                ,import_db=import_db
+                                ,download_dir=download_dir
+                                ,podcast_info=podcast
+                                ,season_info=season
+                                ,auth=auth
+                                )
     else:
         # Podcase is not organized into seasons, so download by episodes
         episode_asins = [child['asin'] for child
@@ -242,16 +324,71 @@ def download_podcast(podcast, download_dir, import_db, auth=None):
                          if     child['relationship_to_product'] == 'child'
                             and child['relationship_type'] == 'episode'
                         ]
-    # Download episodes
-    #TODO
+        add_podcast_episodes(episode_asins=episode_asins
+                            ,import_db=import_db
+                            ,download_dir=download_dir
+                            ,podcast_info=podcast
+                            )
+
+
+def add_podcast_episodes(episode_asins
+                        ,import_db
+                        ,download_dir
+                        ,podcast_info
+                        ,season_info=None
+                        ,auth=None
+                        ):
+    logger = logging.getLogger(__name__)
     for asin in episode_asins:
-        if import_db.is_already_imported(asin):
+        if import_db.is_podcast_episode_already_imported(asin):
+            logger.info("Episode is already imported: %s  %s: %s"
+                       ,podcast_info['asin']
+                       ,podcast_info['title']
+                       ,asin
+                       )
             continue
         episode_info = get_audible_product(asin=asin, auth=auth)
         episode_path = download_podcast_episode(asin, download_dir)
+        if episode_path:
+            title, abs_path = import_episode_into_audiobookshelf(
+                 m4b_file=episode_path
+                ,podcast_info=podcast_info['title']
+                ,season_info=season_info
+                ,episode_info=episode_info
+                ,abs_dir=config['audiobookshelf_ppodcast_dir']
+            )
+        else:
+            logger.warning("Episode not imported: %s  %s: %s  %s"
+                          ,podcast_info['asin']
+                          ,podcast_info['title']
+                          ,asin
+                          ,episode_info['title']
+                          )
+            continue
+
+        # Record episode as having been added to the library
+        import_db.record_episode_as_imported(
+             asin=asin
+            ,title=title
+            ,abs_path=abs_path
+            ,abs_dir=config['audiobookshelf_podcast_dir']
+        )
 
 
-def import_audiobook_into_audiobookshelf(m4b_file, book_info, abs_dir):
+def import_episode_into_audiobookshelf(m4b_file
+                                      ,podcast_info
+                                      ,season_info
+                                      ,episode_info
+                                      ,abs_dir
+                                      ):
+    podcast_title = podcast_info['title']
+    podcast_dir = abs_dir / podcast_title
+    podcast_dir.mkdir(parents=True, exist_ok=True)
+    episode_file = shutil.move(m4b_file, podcast_dir /m4b_file.name)
+    return episode_file.name, episode_file
+
+
+def import_audiobook_into_audiobookshelf(m4b_files, book_info, abs_dir):
     author = ', '.join([a['name'] for a in book_info['authors']])
     if book_info['series']:
         series = book_info['series'][0]['title']
@@ -266,7 +403,7 @@ def import_audiobook_into_audiobookshelf(m4b_file, book_info, abs_dir):
     else:
         narrators = ''
 
-    book_dir = config['audiobookshelf_dir'] / author
+    book_dir = abs_dir / author
     if series:
         book_dir = book_dir / series
         if series_position:
@@ -287,54 +424,9 @@ def import_audiobook_into_audiobookshelf(m4b_file, book_info, abs_dir):
 
     book_dir = book_dir / title
     book_dir.mkdir(parents=True, exist_ok=True)
-    abs_path = shutil.move(m4b_file, book_dir / m4b_file.name)
+    for m4b_file in m4b_files:
+        abs_path = shutil.move(m4b_file, book_dir / m4b_file.name)
     return title, abs_path
-
-
-class ImportDatabase:
-    '''
-    Tracks what files have already been imported into audiobookshelf to prevent
-    constant redownloading, reconverting, and/or reimporting of files
-    '''
-    def __init__(self, db_file):
-        self.con = sqlite3.connect(db_file)
-        self.cur = self.con.cursor()
-        self.setupDatabase(config['db'])
-
-    def is_book_already_imported(self, asin):
-        '''
-        Check whether specified book has already been imported
-        '''
-        res = self.cur.execute("SELECT asin FROM books WHERE asin = ?", (asin,))
-        return len(res.fetchall()) > 0
-
-    def is_podcast_episode_already_imported(self, asin):
-        '''
-        Check whether specified book has already been imported
-        '''
-        res = self.cur.execute("SELECT asin FROM podcast_episodes "
-                               "WHERE asin = ?"
-                              ,(asin,)
-                              )
-        return len(res.fetchall()) > 0
-
-    def record_book_as_imported(self, asin, title, abs_path, abs_dir):
-        '''
-        Record a book as imported
-        '''
-        self.cur.execute('INSERT INTO books (asin, title, location) '
-                         'values (?, ?, ?)'
-                        ,(asin, title, abs_path.relative_to(abs_dir).as_posix())
-                        )
-        self.con.commit()
-
-    def setupDatabase(self, filename):
-        con = sqlite3.connect(filename)
-        cur = con.cursor()
-        cur.execute('CREATE TABLE if not exists books(asin, title, location)')
-        cur.execute('CREATE TABLE if not exists podcast_episodes(asin, title, '
-                    'location)'
-                   )
 
 
 def is_product_released(product_info):
@@ -343,17 +435,21 @@ def is_product_released(product_info):
     return release_date <= datetime.now()
 
 
-def add_book(book, db):
+def add_book(book, db, download_dir, auth=None):
     logger = logging.getLogger(__name__)
     # Download book as aax
     logger.info('Trying to download as aax: %s', book['asin'])
     aax_paths = download_product_as_aax(
                      asin=book['asin']
                     ,quality=config['quality']
-                    ,download_dir=config['audible_download_dir']
+                    ,download_dir=download_dir
+                    ,book=book
                     )
     if len(aax_paths) > 0:
-        tmp_m4b_file = convert_aax_to_m4b(aax_paths, output_dir=config['tmp_dir'])
+        tmp_m4b_files = convert_aax_to_m4b(aax_paths
+                                          ,output_dir=config['tmp_dir']
+                                          ,book=book
+                                          )
     else:
         # Download book as aaxc
         logger.info('Trying to download as aaxc: %s', book['asin'])
@@ -366,10 +462,10 @@ def add_book(book, db):
 
         # Check for aaxc file
         if len(aaxc_paths) > 0 and len(voucher_paths) > 0:
-            tmp_m4b_file = convert_aaxc_to_m4b(aaxc_paths=aaxc_paths
-                                              ,voucher_paths=voucher_paths
-                                              ,output_dir=config['tmp_dir']
-                                              )
+            tmp_m4b_files = convert_aaxc_to_m4b(aaxc_paths=aaxc_paths
+                                               ,voucher_paths=voucher_paths
+                                               ,output_dir=config['tmp_dir']
+                                               )
 
         else:
             logger.warning("No aax or aaxc file for this title: ASIN: %s "
@@ -381,7 +477,7 @@ def add_book(book, db):
 
     # Put it in place in the audiobookshelf
     title, abs_path = import_audiobook_into_audiobookshelf(
-         m4b_file=tmp_m4b_file
+         m4b_files=tmp_m4b_files
         ,book_info=book
         ,abs_dir=config['audiobookshelf_dir']
     )
@@ -415,15 +511,6 @@ def main():
                         )
             continue
 
-        if db.is_book_already_imported(book['asin']):
-            # This book has already been downloaded and added to the library so
-            # move on to the next book in the list
-            logger.info('Book is already imported: %s  %s'
-                       ,book['asin']
-                       ,book['title']
-                        )
-            continue
-
         # Skip periodicals for now -- TODO
         if book['content_delivery_type'] == 'Periodical':
             logger.warning("Skipping because it is of content delivery type "
@@ -432,19 +519,31 @@ def main():
                           ,book['title']
                           )
             continue
-
         # Skip podcasts for now -- TODO
-        if book['content_delivery_type'] == 'PodcastParent':
+        elif book['content_delivery_type'] == 'PodcastParent':
             logger.warning("Skipping because it is of content delivery type "
                            "PodcastParent: %s  %s"
                           ,book['asin']
                           ,book['title']
                           )
             continue
+            #add_podcast(podcast=book
+            #           ,download_dir=config['audible_download_dir']
+            #           ,import_db=db
+            #           ,auth=auth
+            #           )
+        elif (  book['content_delivery_type'] == 'SinglePartBook'
+               or book['content_delivery_type'] == 'MultiPartBook'
+             ):
+            if db.is_book_already_imported(book['asin']):
+                # This book has already been downloaded and added to the library so
+                # move on to the next book in the list
+                logger.info('Book is already imported: %s  %s'
+                           ,book['asin']
+                           ,book['title']
+                            )
+                continue
 
-        if (  book['content_delivery_type'] == 'SinglePartBook'
-           or book['content_delivery_type'] == 'MultiPartBook'
-           ):
             # Check if book is published yet
             if not is_product_released(book):
                 logger.warning('Book is not yet released: %s %s - Release date: %s'
@@ -453,7 +552,17 @@ def main():
                               ,book['release_date']
                               )
                 continue
-            add_book(book, db)
+            add_book(book=book
+                    ,db=db
+                    ,download_dir=config['audible_download_dir']
+                    ,auth=auth
+                    )
+        else:
+            logger.warning("Unhandled content_delivery_type: %s for %s  %s"
+                          ,book['content_delivery_type']
+                          ,book['asin']
+                          ,book['title']
+                          )
 
 
 if __name__ == "__main__":
